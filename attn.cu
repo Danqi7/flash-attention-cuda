@@ -76,6 +76,33 @@ __global__ void gpu_softmax(FP *s, FP *p, int n) {
 
 }
 
+void cpu_attention(FP *q,FP *k, FP *v, FP *o, FP *p, int n, int d) {
+  // Q, K, V, O: [n, d]. usually n>>d
+  FP rowMax, rowSum;
+  int indexq, indexk;
+  for (int row=0; row<n; row++) {
+    rowMax = S_MAX;
+    rowSum = 0.0;
+
+    for (int col=0; col<n; col++) {
+      sVal = 0;
+      indexk = col*d;
+      for (indexq = row*d; indexq < (row*d + d); indexq++, indexk++) {
+        sVal += q[indexq] * k[indexk];
+      }
+      rowMax = max(rowMax, sVal);
+      rowSum += sVal;
+      p[row*n+col] = sVal; // unnormalized
+    }
+
+    // Normalize for each row
+    for (int col=0; col < n; col++)
+      p[row*n+col] = (p[row*n+col] - rowMax) / rowSum;
+  }
+
+
+}
+
 void cpu_matrixmult(FP *a,FP *b, FP *c, int n, int p, int m) {
   // A: [n,p], B: [p, m], C: [n, m]
   int index, indexa, indexb;
