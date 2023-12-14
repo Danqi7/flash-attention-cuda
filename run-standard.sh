@@ -44,5 +44,8 @@ time ./attn 128 64 16
 echo ""
 time ./attn 128 64 16
 echo ""
+time ./attn 1024 64 16 # GPT2
+echo ""
+
 
 echo "***All Done."

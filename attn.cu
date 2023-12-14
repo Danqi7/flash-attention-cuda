@@ -6,6 +6,7 @@
 #include <math.h>
 
 #define S_MAX 1000000
+#define EPS 0.000001
 
 __global__ void gpu_qk_matmul(FP *q,FP *k, FP *s, int n, int d) {
   // Q: [n, d], K: [n, d], S[n, n]; usually n>>d
@@ -72,6 +73,13 @@ __global__ void gpu_softmax(FP *s, FP *p, int n) {
       index = row * n + i;
       p[index] = exp(s[index] - rowMax) / rowSum;
     }
+
+    // check row of P sums up to 1.
+    FP rowProb = 0.;
+    for (int i = 0; i < n; i++)
+      rowProb += p[row*n+i];
+    if (rowProb - 1.0 > EPS)
+      printf("[GPU kernel] rowProb is not 1! rowProb: %.3f\n", rowProb);
   }
 
 }
@@ -104,6 +112,13 @@ void cpu_attention(FP *q,FP *k, FP *v, FP *p, FP *o, int n, int d) {
     // Normalize for each row
     for (int col=0; col < n; col++)
       p[row*n+col] = exp(p[row*n+col] - rowMax) / rowSum;
+    
+    // Check rowProb sums up to 1
+    FP rowProb = 0.;
+    for (int col=0; col < n; col++)
+      rowProb += p[row*n+col];
+    if (rowProb - 1.0 > EPS)
+      printf("[CPU func]rowProb is not 1! rowProb: %.3f\n", rowProb);
       
     // O = PV for each row
     for (int v_col = 0; v_col < d; v_col++) {
@@ -165,7 +180,7 @@ int main(int argc, char *argv[]) {
   int Block_Dim = 1; //Block dimension, x and y, square
 
   int n, d;
-  FP *q,*k,*v, *o; // Q,K,V,O are (n, d) inputs, S,P are intermediate (n, n) matrix
+  FP *q,*k,*v, *o, *p; // Q,K,V,O are (n, d) inputs, S,P are intermediate (n, n) matrix
   FP *dev_q, *dev_k, *dev_v, *dev_s, *dev_p, *dev_o;
   size_t Qsize, Ksize, Vsize, Ssize, Psize, Osize; // number of bytes in arrays
   cudaEvent_t start, stop; // using cuda events to measure time
@@ -323,7 +338,7 @@ int main(int argc, char *argv[]) {
 
 
 // START OF OPTIONAL SECTION THAT CAN BE OMITTED
-/*
+
   // ------------- COMPUTATION DONE ON HOST CPU ----------------------------
   // DEBUGGING USE ONLY (AND FOR LIMITED NUMBERS OF TIMING RUNS)
 
@@ -332,7 +347,8 @@ int main(int argc, char *argv[]) {
 
 
   //cpu_matrixmult(a,b,c, n, p, m); // do calculation on host (NOTE: This computes the diff with GPU result.)
-  cpu_matrixmult_kij(a,b,c, n, p, m); // do calculation on host (NOTE: This computes the diff with GPU result.)
+  p = (FP*) malloc(Psize);
+  cpu_attention(q,k,v, p,o, n,d);
 
   cudaEventRecord(stop, 0); // instrument code to measue end time
   cudaEventSynchronize(stop);
@@ -342,22 +358,16 @@ int main(int argc, char *argv[]) {
 
 // ------------------- check device creates correct results -----------------
 
-  double error, suma, sumb, sumc, ai, bi, ci;
-  suma = 0.; sumb = 0; sumc = 0;
-  for(i=0;i < n*n;i++) {
-    ai = (double) a[i];
-    bi = (double) b[i];
-    ci = (double) c[i];
-    suma += ai*ai;
-    sumb += bi*bi;
-    sumc += ci*ci;
+  double error, sumv, vi;
+  sumv = 0.;
+  for(i=0;i < n*d; i++) {
+    vi = (double) v[i];
+    sumv += vi * vi;
   }
-  suma = sqrt(suma);
-  sumb = sqrt(sumb);
-  sumc = sqrt(sumc);
-  error =  sumc/(suma*sumb);
+  sumv = sqrt(sumv);
+  error =  sumv / (n*d);
   printf("Approximate relative error between GPU and CPU: %e\n", error);
-*/
+  free(p);
 // END OF OPTIONAL SECTION THAT CAN BE OMITTED
 // -------------- clean up ---------------------------------------
 
