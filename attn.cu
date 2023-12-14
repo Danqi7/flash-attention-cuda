@@ -76,10 +76,11 @@ __global__ void gpu_softmax(FP *s, FP *p, int n) {
 
 }
 
-void cpu_attention(FP *q,FP *k, FP *v, FP *o, FP *p, int n, int d) {
+void cpu_attention(FP *q,FP *k, FP *v, FP *p, FP *o, int n, int d) {
   // Q, K, V, O: [n, d]. usually n>>d
-  FP rowMax, rowSum;
+  FP rowMax, rowSum, sVal, oVal;
   int indexq, indexk;
+  // S = QK^T; P = softmax(S) row-wise;
   for (int row=0; row<n; row++) {
     rowMax = S_MAX;
     rowSum = 0.0;
@@ -91,15 +92,28 @@ void cpu_attention(FP *q,FP *k, FP *v, FP *o, FP *p, int n, int d) {
         sVal += q[indexq] * k[indexk];
       }
       rowMax = max(rowMax, sVal);
-      rowSum += sVal;
-      p[row*n+col] = sVal; // unnormalized
+      p[row*n+col] = sVal; // unnormalized, wt sub, wt exponentials
+    }
+
+    // Subtract max of row for numerical stability
+    // Sum up elements in the same row
+    for (int col=0; col < n; col++) {
+      rowSum += exp(p[row*n+col] - rowMax);
     }
 
     // Normalize for each row
     for (int col=0; col < n; col++)
-      p[row*n+col] = (p[row*n+col] - rowMax) / rowSum;
+      p[row*n+col] = exp(p[row*n+col] - rowMax) / rowSum;
+      
+    // O = PV for each row
+    for (int v_col = 0; v_col < d; v_col++) {
+      oVal = 0;
+      for (int col=0; col < n; col++) {
+        oVal += p[row*n+col] * v[col*d+v_col];
+      }
+      o[row*d+v_col] -= oVal; // NOTE: This calculates the diff between CPU and GPU computations.
+    }
   }
-
 
 }
 
