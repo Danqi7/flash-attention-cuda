@@ -17,7 +17,10 @@ GENCODE = $(GENCODE_SM75)
 
 .SUFFIXES : .cu
 
-BINARIES = attn
+BINARIES = attn flash_attention
+
+flash_attention: flash_attention.o
+	$(NVCC) $(GENCODE) $(LFLAGS) -o $@ $<
 
 attn: attn.o
 	$(NVCC) $(GENCODE) $(LFLAGS) -o $@ $<

@@ -5,9 +5,15 @@
 #include <stdlib.h>
 #include <math.h>
 
+#define Br 8
+#define Bc 8
+#define d 32
+
+#define S_MAX 1000000
+#define EPS 0.000001
 
 // Fused flash attention kernel
-void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n, int d, int Br, int Bc) {
+__global__ void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n) {
     /*
         Q, V, K, O : [n, d]; l, m : [n,]
         Divide Q into Q1, Q2, ..., QTr of shape [Br, d]
@@ -16,109 +22,125 @@ void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n, int d, int Br, 
         Divide l, m into l1/m1, ..., lTr/mTr of shape [Br,]
     */
 
-    int Tr = (n + Br - 1) / Br;
-    int Tc = (n + Bc - 1) / Bc;
+  //int Tr = (n + Br - 1) / Br;
+  int Tc = (n + Bc - 1) / Bc;
+  
+  __shared__ FP Kj[Bc][d];
+  __shared__ FP Vj[Bc][d];
+  __shared__ FP Qi[Br][d];
+  __shared__ FP Oi[Br][d];
+  __shared__ FP Sij[Br][Bc];
+  
+  __shared__ FP tmp_Oi[Br][d];
+  __shared__ FP Pij_delta[Br][Bc];
+
+  __shared__ FP li[Br];
+  __shared__ FP mi[Br];
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  int col = tx + blockDim.x * blockIdx.x; // col is tx when GridDim.x = 1
+  int row = ty + blockDim.y * blockIdx.y;
+  if (row == 0 & col == 0){
+    printf("starting Tc loop...");
+  }
+  for (int j = 0; j < Tc; j++) {
+    // Load Kj, Vj from HBM to on-chip SRAM
+    if ((j*Bc+tx) < n) {
+      for (int idx=0; idx < d; idx++) {
+          //Kj[tx][idx] = K[col][idx]
+          Kj[tx][idx] = K[j*Bc*d + tx*d + idx];
+          Vj[tx][idx] = V[j*Bc*d + tx*d + idx];
+      }
+    }
     
-    __shared__ FP Kj[Bc][d];
-    __shared__ FP Vj[Bc][d];
-    __shared__ FP Qi[Br][d];
-    __shared__ FP Oi[Br][d];
-    __shared__ FP Sij[Br][Bc];
-    
-    __shared__ FP tmp_Oi[Br][d];
-
-    __shared__ FP li[Br];
-    __shared__ FP mi[Br];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int col = tx + blockDim.x * blockIdx.x; // col is tx when GridDim.x = 1
-    int row = ty + blockDim.y * blockIdx.y;
-
-    for (int j = 0; j < Tc; j++) {
-        // Load Kj, Vj from HBM to on-chip SRAM
-        if (col < n) {
-            for (int idx=0; idx < d: idx++) {
-                //Kj[tx][idx] = K[col][idx]
-                Kj[tx*d + idx] = K[j*Bc + tx*d + idx];
-                Vj[tx*d + idx] = V[j*Bc + tx*d + idx];
-            }
+    // Load Qi, Oi, li, mi from HBM to on-chip SRAM
+    if (row < n) {
+        for (int idx=0; idx < d; idx++) {
+            //Q[ty][idx] = Q[row*d][idx]
+            Qi[ty][idx] = Q[row * d + idx];
+            Oi[ty][idx] = O[row * d + idx];
         }
-        
-        // Load Qi, Oi, li, mi from HBM to on-chip SRAM
-        if (row < n) {
-            for (int idx=0; idx < d: idx++) {
-                //Q[ty][idx] = Q[row*d][idx]
-                Qi[ty*d + idx] = Q[row * d + idx];
-                Oi[ty*d + idx] = O[row * d + idx];
-            }
-            li[ty] = l[row];
-            mi[ty] = m[row];
+        li[ty] = l[row];
+        mi[ty] = m[row];
+    }
+
+    // make sure Qi, Oi, Kj, Vj are loaded
+    __syncthreads();
+
+    // Compute Sij = QiKj^T
+    FP sVal = 0.0;
+    for (int idx=0; idx < d; idx++) {
+        sVal += Qi[ty][idx] * Kj[tx][idx];
+    }
+    Sij[ty][tx] = sVal; // Sij is of size [Br x Bc]
+    // make sure Sij is computed
+    __syncthreads();
+
+    // Compute rowmax m^~_ij
+    // mij_delta[ty] = max(mij_delta[ty], Sij[ty*Bc + tx]); // Assume mij_delta is initialized to -inf
+    // __syncthreads();
+    FP mij_delta = -INFINITY;
+    for (int idx=0; idx < Bc; idx++) {
+        mij_delta = max(mij_delta, Sij[ty][idx]);
+    }
+    __syncthreads();
+
+    // P^~_ij
+    //Pij_delta = exp(S[ty*Bc + tx] - m_delta[ty]);
+    Pij_delta[ty][tx] = exp(Sij[ty][tx] - mij_delta);
+    __syncthreads();
+
+    // l^~_ij
+    //lij_delta[ty] += Pij_delta; // Assume l_delta is initialized to 0
+    FP lij_delta = 0;
+    for (int idx=0; idx < Bc; idx++) {
+        lij_delta += Pij_delta[ty][idx];
+    }
+    __syncthreads();
+
+    // Compute new m, l
+    FP mi_new = max(mi[ty], mij_delta);
+    FP coeffold = exp(mi[ty] - mi_new);
+    FP coeffcur = exp(mij_delta - mi_new);
+    FP li_new = coeffold * li[ty] + coeffcur * lij_delta; // per row in Br
+
+    // Update Oi: each row doing ([1,Bc]).dot([Bc,d]) = [1,d]
+    for (int idx=0; idx < d; idx++) {
+        tmp_Oi[ty][idx] = 0;
+    }
+    for (int idx=0; idx < d; idx++) {
+        //tmp_Oi[ty*d + idx] += (li[ty] * coeffold * Oi[ty*d+idx] + coeffcur * Pij_delta * Vj[tx*d+idx]) / li_new;
+        //race condition?
+        tmp_Oi[ty][idx] += coeffcur * Pij_delta[ty][tx] * Vj[tx][idx];
+    }
+    if (tx == 0) {
+      for (int idx=0; idx < d; idx++) {
+        tmp_Oi[ty][idx] += li[ty] * coeffold * Oi[ty][idx];
+      }
+      for (int idx=0; idx < d; idx++) {
+        tmp_Oi[ty][idx] = tmp_Oi[ty][idx] / li_new;
+      }
+    }
+    __syncthreads();
+
+    // Update Oi in HBM
+    if (row < n) {
+        for (int idx=0; idx < d; idx++) {
+            O[row*d + idx] = tmp_Oi[ty][idx];
         }
+    }
 
-        // make sure Qi, Oi, Kj, Vj are loaded
-        __syncthreads();
+    // Update li, mi in HBM
+    l[row] = li_new;
+    m[row] = mi_new;
+    __syncthreads();
 
-        // Compute Sij = QiKj^T
-        FP sVal = 0.0;
-        for (int idx=0; idx < d: idx++) {
-            sVal += Qj[ty*d + idx] * Kj[tx*d + idx];
-        }
-        Sij[ty*Bc + tx] = sVal; // Sij is of size [Br x Bc]
-        // make sure Sij is computed
-        __syncthreads();
-
-        // Compute rowmax m^~_ij
-        // mij_delta[ty] = max(mij_delta[ty], Sij[ty*Bc + tx]); // Assume mij_delta is initialized to -inf
-        // __syncthreads();
-        FP mij_delta = -inf;
-        for (int idx=0; idx < Bc; idx++) {
-            mij_delta = max(mij_delta, Sij[ty * Bc + idx]);
-        }
-        // P^~_ij
-        //Pij_delta = exp(S[ty*Bc + tx] - m_delta[ty]);
-        FP Pij_delta = exp(Sij[ty*Bc + tx] - mij_delta);
-
-        // l^~_ij
-        //lij_delta[ty] += Pij_delta; // Assume l_delta is initialized to 0
-        //__syncthreads();
-        FP lij_delta = 0;
-        for (int idx=0; idx < Bc; idx++) {
-            lij_delta += Pij_delta[ty * Bc + idx];
-        }
-
-        // Compute new m, l
-        FP mi_new = max(mi[ty], mij_delta);
-        FP coeffold = exp(mi[ty] - mi_new);
-        FP coeffcur = exp(mij_delta - mi_new);
-        li_new = coeffold * li[ty] + coeffcur * lij_delta; // per row in Br
-
-        // Update Oi: each row doing ([1,Bc]).dot([Bc,d]) = [1,d]
-        for (int idx=0; idx < d: idx++) {
-            tmp_Oi[ty*d + idx] = 0;
-        }
-        for (int idx=0; idx < d: idx++) {
-            tmp_Oi[ty*d + idx] += (li[ty] * coeffold * Oi[ty*d+idx] + coeffcur * Pij_delta * Vj[tx*d+idx]) / li_new;
-        }
-        __syncthreads();
-
-        // Update Oi in HBM
-        if (row < n) {
-            for (int idx=0; idx < d: idx++) {
-                O[row*d + idx] = tmp_Oi[ty*d + idx];
-            }
-        }
-
-        // Update li, mi in HBM
-        li[ty] = li_new;
-        mi[ty] = mi_new;
-        __syncthreads();
-
-    }   
+  }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
   int i, j; // loop counters
 
   int gpucount = 0; // Count of available GPUs
@@ -128,10 +150,12 @@ int main() {
   int Block_Dim_X = 1; //Block dimension
   int Block_Dim_Y = 1;
 
-  int n, d;
-  FP *q,*k,*v, *o, *p; // Q,K,V,O are (n, d) inputs, S,P are intermediate (n, n) matrix
-  FP *dev_q, *dev_k, *dev_v, *dev_s, *dev_p, *dev_o;
-  size_t Qsize, Ksize, Vsize, Ssize, Psize, Osize; // number of bytes in arrays
+  int n;
+  FP *q,*k,*v, *o; // Q,K,V,O are (n, d) inputs, S,P are intermediate (n, n) matrix
+  FP *l, *m;
+  FP *dev_q, *dev_k, *dev_v, *dev_o;
+  FP *dev_l, *dev_m;
+  size_t Qsize; // number of bytes in arrays
   cudaEvent_t start, stop; // using cuda events to measure time
   float elapsed_time_ms; // which is applicable for asynchronous code also
   cudaError_t errorcode;
@@ -147,64 +171,85 @@ int main() {
      printf("Device count = %d\n",gpucount);
   }
 
-  if (argc!=5) {
-    printf("Usage: flash_attn <matrix dim n> <matrix dim d> <block dim Y Br> <block dim X Bc>\n");
+  if (argc!=2) {
+    printf("Usage: flash_attn <matrix dim n>\n");
     exit (-1);
   }
 
   n = atoi(argv[1]);
-  d = atoi(argv[2]);
-  Block_Dim_Y = atoi(argv[3]); // Non-square block, [Br, Bc]
-  Block_Dim_X = atoi(argv[4]);
+  //d = atoi(argv[2]);
+  //Block_Dim_Y = atoi(argv[3]); // Non-square block, [Br, Bc]
+  //Block_Dim_X = atoi(argv[4]);
+  Block_Dim_Y = Br; // Non-square block, [Br, Bc]
+  Block_Dim_X = Bc;
   if (Block_Dim_Y*Block_Dim_X > 1024) {
     printf("Error, too many threads in block\n");
     exit (-1);
   }
 
   cudaSetDevice(gpunum);
+  printf("Debugging....\n");
   printf("Using device %d\n",gpunum);
   printf("Matrix Q,K,V Dimension = [%d, %d]\n", n, d);
-
+  printf("qsize done.\n");
   Qsize = n * d * sizeof(FP);
-  Ksize = n * d * sizeof(FP);
-  Vsize = n * d * sizeof(FP);
-  Osize = n * d * sizeof(FP);
-
+  //Psize = n * n * sizeof(FP);
+  printf("malloc ...\n");
   q = (FP*) malloc(Qsize); // dynamically allocated memory for arrays on host
-  k = (FP*) malloc(Ksize);
-  v = (FP*) malloc(Vsize);
-  o = (FP*) malloc(Osize); // final output
+  k = (FP*) malloc(Qsize);
+  v = (FP*) malloc(Qsize);
+  o = (FP*) malloc(Qsize); // final output
+  l = (FP*) malloc(n*sizeof(FP));
+  m = (FP*) malloc(n*sizeof(FP));
 
   srand(12345);
+  printf("q start.\n");
   for(i=0;i < n;i++)
     for(j=0;j < d;j++) {
+      //printf("q: %d, %d:\n", i, j);
       q[i * d + j] = (FP) rand() / (FP) RAND_MAX;
       //      a[i * p + j] = (FP) i+j; // may be helpful for debugging
     }
+  printf("q done.");
   for(i=0;i < n;i++)
     for(j=0;j < d;j++) {
+      //printf("k: %d, %d:\n", i, j);
       k[i * d + j] = (FP) rand() / (FP) RAND_MAX;
       //      b[i * n + j] = (FP) i+j; // may be helpful for debugging
     }
   for(i=0;i < n;i++)
     for(j=0;j < d;j++) {
+      //printf("v: %d, %d:\n", i, j);
       v[i * d + j] = (FP) rand() / (FP) RAND_MAX;
       //      b[i * n + j] = (FP) i+j; // may be helpful for debugging
     }
+  printf("Init O, m, l...");
+  // Init O, m, l
+  for (i=0;i < n;i++)
+    for(j=0;j < d;j++) {
+      printf("o: %d, %d:\n", i, j);
+      o[i*d+j] = 0.0;
+    }
 
+  for (i=0;i<n;i++) {
+    printf("l/m: %d:\n", i);
+    l[i] = 0;
+    m[i] = -INFINITY;
+  }
+  printf("START GPU CODE...");
   // ------------- COMPUTATION DONE ON GPU ----------------------------
 
   cudaMalloc((void**)&dev_q, Qsize); // allocate memory on device
-  cudaMalloc((void**)&dev_k, Ksize);
-  cudaMalloc((void**)&dev_v, Vsize);
-  cudaMalloc((void**)&dev_o, Osize);
+  cudaMalloc((void**)&dev_k, Qsize);
+  cudaMalloc((void**)&dev_v, Qsize);
+  cudaMalloc((void**)&dev_o, Qsize);
   cudaMalloc((void**)&dev_l, n * sizeof(FP));
   cudaMalloc((void**)&dev_m, n * sizeof(FP));
 
   cudaMemcpy(dev_q, q , Qsize ,cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_k, k , Ksize ,cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_v, v , Vsize ,cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_o, o , Osize ,cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_k, k , Qsize ,cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_v, v , Qsize ,cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_o, o , Qsize ,cudaMemcpyHostToDevice);
   cudaMemcpy(dev_l, l , n * sizeof(FP) ,cudaMemcpyHostToDevice);
   cudaMemcpy(dev_m, m , n * sizeof(FP) ,cudaMemcpyHostToDevice);
 
@@ -216,7 +261,8 @@ int main() {
 
   Grid_Dim_X = 1; //  how many blocks in X direction
   Grid_Dim_Y = (n + Block_Dim_Y - 1) / Block_Dim_Y; // how many blocks in Y direction
-  if (Grid_Dim_X*Block_Dim_x < n) {
+  int Tc = (n + Bc - 1) / Bc;
+  if (Grid_Dim_X*Block_Dim_X*Tc < n) {
     printf("Error, number of threads in x dimensions less than number of array elements\n");
     exit (-1);
   }
@@ -228,17 +274,34 @@ int main() {
   dim3 Grid(Grid_Dim_X, Grid_Dim_Y); //Grid structure
   dim3 Block(Block_Dim_X, Block_Dim_Y); //Block structure
   
-  flash_attn<<<Grid,Block>>>(dev_q, dev_k, dev_v, dev_o, n, d, Block_Dim_Y, Block_Dim_X);
+  flash_attn<<<Grid,Block>>>(dev_q, dev_k, dev_v, dev_o, dev_l, dev_m, n);
+
+  // Check for any errors launching the kernel
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+      fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(error));
+      // Handle the error, e.g., clean up, log more info, exit, etc.
+  }
+
+  // Optionally, synchronize device to catch errors in kernel execution
+  cudaDeviceSynchronize();
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+      fprintf(stderr, "Kernel execution failed: %s\n", cudaGetErrorString(error));
+      // Handle the error
+  }
 
   cudaEventRecord(stop, 0); // instrument code to measure end time
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&elapsed_time_ms, start, stop);
 
+  cudaMemcpy(o, dev_o, Qsize ,cudaMemcpyDeviceToHost);
+
   printf("Time for Flash Attention on GPU: %f ms.\n", elapsed_time_ms);
 
 
 // START OF OPTIONAL SECTION THAT CAN BE OMITTED
-
+/*
   // ------------- COMPUTATION DONE ON HOST CPU ----------------------------
   // DEBUGGING USE ONLY (AND FOR LIMITED NUMBERS OF TIMING RUNS)
 
@@ -246,7 +309,8 @@ int main() {
   // cudaEventSynchronize(start); // not needed
 
   //cpu_matrixmult(a,b,c, n, p, m); // do calculation on host (NOTE: This computes the diff with GPU result.)
-  p = (FP*) malloc(Psize);
+
+  FP* p = (FP*) malloc(n*n*sizeof(FP));
   cpu_attention(q,k,v, p,o, n,d);
 
   cudaEventRecord(stop, 0); // instrument code to measue end time
@@ -267,6 +331,7 @@ int main() {
   error =  sumv / (n*d);
   printf("Approximate relative error between GPU and CPU: %e\n", error);
   free(p);
+  */
 // END OF OPTIONAL SECTION THAT CAN BE OMITTED
 // -------------- clean up ---------------------------------------
 
@@ -274,6 +339,8 @@ int main() {
   free(k);
   free(v);
   free(o);
+  free(l);
+  free(m);
   cudaFree(dev_q);
   cudaFree(dev_k);
   cudaFree(dev_v);
