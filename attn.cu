@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define S_MAX 1000000
 #define EPS 0.000001
 
 __global__ void gpu_qk_matmul(FP *q,FP *k, FP *s, int n, int d) {
@@ -55,7 +54,7 @@ __global__ void gpu_softmax(FP *s, FP *p, int n) {
 
   if (row < n) {
     // subtract max of row for numerical stability
-    FP rowMax = -S_MAX;
+    FP rowMax = -INFINITY;
     for (int i = 0; i < n; i++) {
         rowMax = max(rowMax, s[row * n + i]);
     }
@@ -90,7 +89,7 @@ void cpu_attention(FP *q,FP *k, FP *v, FP *p, FP *o, int n, int d) {
   int indexq, indexk;
   // S = QK^T; P = softmax(S) row-wise;
   for (int row=0; row<n; row++) {
-    rowMax = S_MAX;
+    rowMax = INFINITY;
     rowSum = 0.0;
 
     for (int col=0; col<n; col++) {
