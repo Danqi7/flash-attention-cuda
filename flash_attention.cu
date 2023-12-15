@@ -7,10 +7,57 @@
 
 #define Br 8
 #define Bc 8
-#define d 32
+#define d 4
 
-#define S_MAX 1000000
 #define EPS 0.000001
+
+void cpu_attention(FP *q,FP *k, FP *v, FP *p, FP *o, int n) {
+  // Q, K, V, O: [n, d]. usually n>>d
+  FP rowMax, rowSum, sVal, oVal;
+  int indexq, indexk;
+  // S = QK^T; P = softmax(S) row-wise;
+  for (int row=0; row<n; row++) {
+    rowMax = INFINITY;
+    rowSum = 0.0;
+
+    for (int col=0; col<n; col++) {
+      sVal = 0;
+      indexk = col*d;
+      for (indexq = row*d; indexq < (row*d + d); indexq++, indexk++) {
+        sVal += q[indexq] * k[indexk];
+      }
+      rowMax = max(rowMax, sVal);
+      p[row*n+col] = sVal; // unnormalized, wt sub, wt exponentials
+    }
+
+    // Subtract max of row for numerical stability
+    // Sum up elements in the same row
+    for (int col=0; col < n; col++) {
+      rowSum += exp(p[row*n+col] - rowMax);
+    }
+
+    // Normalize for each row
+    for (int col=0; col < n; col++)
+      p[row*n+col] = exp(p[row*n+col] - rowMax) / rowSum;
+    
+    // Check rowProb sums up to 1
+    FP rowProb = 0.;
+    for (int col=0; col < n; col++)
+      rowProb += p[row*n+col];
+    if (rowProb - 1.0 > EPS)
+      printf("[CPU func]rowProb is not 1! rowProb: %.3f\n", rowProb);
+      
+    // O = PV for each row
+    for (int v_col = 0; v_col < d; v_col++) {
+      oVal = 0;
+      for (int col=0; col < n; col++) {
+        oVal += p[row*n+col] * v[col*d+v_col];
+      }
+      o[row*d+v_col] -= oVal; // NOTE: This calculates the diff between CPU and GPU computations.
+    }
+    
+  }
+}
 
 // Fused flash attention kernel
 __global__ void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n) {
@@ -43,7 +90,7 @@ __global__ void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n) {
   int col = tx + blockDim.x * blockIdx.x; // col is tx when GridDim.x = 1
   int row = ty + blockDim.y * blockIdx.y;
   if (row == 0 & col == 0){
-    printf("starting Tc loop...");
+    printf("starting Tc loop...\n");
   }
   for (int j = 0; j < Tc; j++) {
     // Load Kj, Vj from HBM to on-chip SRAM
@@ -140,6 +187,7 @@ __global__ void flash_attn(FP *Q, FP *K, FP *V, FP *O, FP *l, FP *m, int n) {
   }
 }
 
+
 int main(int argc, char *argv[]) {
   int i, j; // loop counters
 
@@ -191,10 +239,9 @@ int main(int argc, char *argv[]) {
   printf("Debugging....\n");
   printf("Using device %d\n",gpunum);
   printf("Matrix Q,K,V Dimension = [%d, %d]\n", n, d);
-  printf("qsize done.\n");
   Qsize = n * d * sizeof(FP);
   //Psize = n * n * sizeof(FP);
-  printf("malloc ...\n");
+  //printf("malloc ...\n");
   q = (FP*) malloc(Qsize); // dynamically allocated memory for arrays on host
   k = (FP*) malloc(Qsize);
   v = (FP*) malloc(Qsize);
@@ -203,14 +250,12 @@ int main(int argc, char *argv[]) {
   m = (FP*) malloc(n*sizeof(FP));
 
   srand(12345);
-  printf("q start.\n");
   for(i=0;i < n;i++)
     for(j=0;j < d;j++) {
       //printf("q: %d, %d:\n", i, j);
       q[i * d + j] = (FP) rand() / (FP) RAND_MAX;
       //      a[i * p + j] = (FP) i+j; // may be helpful for debugging
     }
-  printf("q done.");
   for(i=0;i < n;i++)
     for(j=0;j < d;j++) {
       //printf("k: %d, %d:\n", i, j);
@@ -227,12 +272,12 @@ int main(int argc, char *argv[]) {
   // Init O, m, l
   for (i=0;i < n;i++)
     for(j=0;j < d;j++) {
-      printf("o: %d, %d:\n", i, j);
+      //printf("o: %d, %d:\n", i, j);
       o[i*d+j] = 0.0;
     }
 
   for (i=0;i<n;i++) {
-    printf("l/m: %d:\n", i);
+    //printf("l/m: %d:\n", i);
     l[i] = 0;
     m[i] = -INFINITY;
   }
@@ -276,21 +321,6 @@ int main(int argc, char *argv[]) {
   
   flash_attn<<<Grid,Block>>>(dev_q, dev_k, dev_v, dev_o, dev_l, dev_m, n);
 
-  // Check for any errors launching the kernel
-  cudaError_t error = cudaGetLastError();
-  if (error != cudaSuccess) {
-      fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(error));
-      // Handle the error, e.g., clean up, log more info, exit, etc.
-  }
-
-  // Optionally, synchronize device to catch errors in kernel execution
-  cudaDeviceSynchronize();
-  error = cudaGetLastError();
-  if (error != cudaSuccess) {
-      fprintf(stderr, "Kernel execution failed: %s\n", cudaGetErrorString(error));
-      // Handle the error
-  }
-
   cudaEventRecord(stop, 0); // instrument code to measure end time
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&elapsed_time_ms, start, stop);
@@ -301,7 +331,7 @@ int main(int argc, char *argv[]) {
 
 
 // START OF OPTIONAL SECTION THAT CAN BE OMITTED
-/*
+
   // ------------- COMPUTATION DONE ON HOST CPU ----------------------------
   // DEBUGGING USE ONLY (AND FOR LIMITED NUMBERS OF TIMING RUNS)
 
@@ -311,27 +341,27 @@ int main(int argc, char *argv[]) {
   //cpu_matrixmult(a,b,c, n, p, m); // do calculation on host (NOTE: This computes the diff with GPU result.)
 
   FP* p = (FP*) malloc(n*n*sizeof(FP));
-  cpu_attention(q,k,v, p,o, n,d);
+  cpu_attention(q,k,v, p,o, n);
 
   cudaEventRecord(stop, 0); // instrument code to measue end time
   cudaEventSynchronize(stop);
-  cudaEventElapsedTime(&elapsed_time_ms, start, stop );
+  cudaEventElapsedTime(&elapsed_time_ms, start, stop);
 
   printf("Time to calculate results on CPU: %f ms.\n", elapsed_time_ms); // exec. time
 
 // ------------------- check device creates correct results -----------------
 
-  double error, sumv, vi;
+  double oerror, sumv, vi;
   sumv = 0.;
   for(i=0;i < n*d; i++) {
     vi = (double) v[i];
     sumv += vi * vi;
   }
   sumv = sqrt(sumv);
-  error =  sumv / (n*d);
-  printf("Approximate relative error between GPU and CPU: %e\n", error);
+  oerror =  sumv / (n*d);
+  printf("Approximate relative error between GPU and CPU: %e\n", oerror);
   free(p);
-  */
+  
 // END OF OPTIONAL SECTION THAT CAN BE OMITTED
 // -------------- clean up ---------------------------------------
 
