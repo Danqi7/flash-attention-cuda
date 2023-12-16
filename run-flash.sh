@@ -40,12 +40,19 @@ make flash_attention
 # the job (possibly as much as 2 hours if you run all 4 test cases)
 echo ""
 echo "***Running Flash Attention module (n)"
-time ./flash_attention 128
-echo ""
 # time ./flash_attention 128
 # echo ""
+# time ./flash_attention 256
+# echo ""
+# time ./flash_attention 512
+# echo ""
 # time ./flash_attention 1024 # GPT2
+# echo ""
+# time ./flash_attention 2048
+# echo ""
+# time ./flash_attention 4096
+# echo ""
+time ./flash_attention 8192
 echo ""
-
 
 echo "***All Done."

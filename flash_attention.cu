@@ -5,9 +5,9 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define Br 8
-#define Bc 8
-#define d 4
+#define Br 2
+#define Bc 2
+#define d 64
 
 #define EPS 0.000001
 
