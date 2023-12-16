@@ -26,13 +26,6 @@ sbatch run-standard.sh # naive GPU implementation
 sbatch run-flash.sh # forward flash attention
 ```
 
-### Results
-All experiments were run on a single NVIDIA GeForce RTX 2080 Ti. The Q,V,K, shape (N,d), are randomly initialized with values between 0 and 1. The attention mechanism is run 100 times and the average runtime is reported.
-
-|  N  |  d  | CPU (ms) | Naive GPU (ms) | Flash GPU (ms) 
-|-----|-----|----------|----------------|----------------|
-| 1000| 1000| 0.000    | 0.000          | 0.000          |
-| 2000| 2000| 0.000    | 0.000          | 0.000          |
 
 
 
